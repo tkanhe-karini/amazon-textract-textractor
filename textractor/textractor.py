@@ -1,7 +1,7 @@
 """
 :class:`Textractor` is the main class associated with this package. It needs to be instantiated before using any of the functionalities
 the package provides. The main use of this class is to make calls to the Textract API and create Python objects for all the
-document entities that are returned in the JSON output of the API. The response received is implicitly parsed and a :class:`Document` type 
+document entities that are returned in the JSON output of the API. The response received is implicitly parsed and a :class:`Document` type
 object is returned containing all the document entities, their associated relationships and metadata.
 
 The Textract API and Textractor method mapping is as below. Use these wrappers to make calls and parse the responses
@@ -18,22 +18,22 @@ in one step.
 """
 
 import io
-import os
-import boto3
 import logging
+import os
 import uuid
-from PIL import Image
 from copy import deepcopy
-from typing import List, Union
+
+import boto3
+from PIL import Image
 from textractcaller import (
+    OutputConfig,
+    QueriesConfig,
+    Query,
     call_textract,
     call_textract_analyzeid,
     call_textract_expense,
-    OutputConfig,
-    Query,
-    QueriesConfig,
 )
-from textractcaller.t_call import Textract_Call_Mode, Textract_API, get_full_json
+from textractcaller.t_call import Textract_API, Textract_Call_Mode, get_full_json
 
 try:
     try:
@@ -52,17 +52,17 @@ from textractor.data.constants import (
 )
 from textractor.entities.document import Document
 from textractor.entities.lazy_document import LazyDocument
-from textractor.parsers import response_parser
-from textractor.utils.s3_utils import upload_to_s3, s3_path_to_bucket_and_prefix
-from textractor.utils.pdf_utils import rasterize_pdf
 from textractor.exceptions import (
-    InputError,
     IncorrectMethodException,
+    InputError,
+    InvalidS3ObjectException,
     MissingDependencyException,
     UnhandledCaseException,
     UnsupportedDocumentException,
-    InvalidS3ObjectException,
 )
+from textractor.parsers import response_parser
+from textractor.utils.pdf_utils import rasterize_pdf
+from textractor.utils.s3_utils import s3_path_to_bucket_and_prefix, upload_to_s3
 
 
 class Textractor:
@@ -73,45 +73,70 @@ class Textractor:
                                 :code:`[default]
                                 region = us-west-2
                                 output=json`
-    :type profile_name: str
-    :param region_name: If AWSCLI isn't setup, the user can pass region to let boto3 pick up credentials from the system.
-    :param region_name: str
     :type profile_name: str, optional
+    :param region_name: If AWSCLI isn't setup, the user can pass region to let boto3 pick up credentials from the system.
+    :type region_name: str, optional
     :param kms_key_id: Customer's AWS KMS key (cryptographic key)
     :type kms_key_id: str, optional
+    :param iam_role_arn: The ARN of the IAM role to assume for authentication.
+    :type iam_role_arn: str, optional
+    :param external_id: The external ID to use when assuming the IAM role.
+    :type external_id: str, optional
+    :param aws_access_key_id: AWS access key ID for direct credential-based authentication.
+    :type aws_access_key_id: str, optional
+    :param aws_secret_access_key: AWS secret access key for direct credential-based authentication.
+    :type aws_secret_access_key: str, optional
     """
 
     def __init__(
         self,
-        profile_name: str = None,
-        region_name: str = None,
+        profile_name: str | None = None,
+        region_name: str | None = None,
         kms_key_id: str = "",
+        iam_role_arn: str | None = None,
+        external_id: str | None = None,
+        aws_access_key_id: str | None = None,
+        aws_secret_access_key: str | None = None,
     ):
-        self.profile_name = profile_name
-        self.region_name = region_name
         self.kms_key_id = kms_key_id
 
-        if self.profile_name is not None:
-            self.session = boto3.session.Session(profile_name=self.profile_name)
-        elif self.region_name is not None:
-            self.session = boto3.session.Session(region_name=self.region_name)
+        if profile_name:
+            # Use profile name for session
+            session = boto3.session.Session(profile_name=profile_name)
+        elif aws_access_key_id and aws_secret_access_key:
+            # Use direct credentials for session
+            session = boto3.session.Session(
+                aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key,
+                region_name=region_name,
+            )
+        elif iam_role_arn and external_id:
+            # Assume IAM role for session
+            sts_client = boto3.client("sts", region_name=region_name)
+            assumed_role = sts_client.assume_role(
+                RoleArn=iam_role_arn,
+                RoleSessionName="TextractorSession",
+                ExternalId=external_id,
+            )
+            credentials = assumed_role["Credentials"]
+            session = boto3.session.Session(
+                aws_access_key_id=credentials["AccessKeyId"],
+                aws_secret_access_key=credentials["SecretAccessKey"],
+                aws_session_token=credentials["SessionToken"],
+                region_name=region_name,
+            )
         elif os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"):
-            # We support both AWS_REGION and AWS_DEFAULT_REGION, with AWS_REGION having precedence.
-            self.region_name = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
-            self.session = boto3.session.Session(region_name=self.region_name)
+            # Use environment variables for region
+            region_name = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+            session = boto3.session.Session(region_name=region_name)
         else:
-            raise InputError(
-                "Unable to initiate Textractor. Either profile_name or region requires an input parameter."
-            )
-        if self.region_name is not None:
-            self.textract_client = self.session.client(
-                "textract", region_name=self.region_name
-            )
-        else:
-            self.textract_client = self.session.client("textract")
-        self.s3_client = self.session.client("s3")
+            raise ValueError("Unable to initiate Textractor. Provide either profile_name, credentials, or IAM role details.")
 
-    def _get_document_images_from_path(self, filepath: str) -> List[Image.Image]:
+        # Initialize clients
+        self.textract_client = session.client("textract", region_name=region_name)
+        self.s3_client = session.client("s3")
+
+    def _get_document_images_from_path(self, filepath: str) -> list[Image.Image]:
         """
         Converts the every page in the document to an image. It supports pdfs and image formats that can be opened by
         PIL package. Documents can be stored in the local computer or on an S3 Bucket.
@@ -119,7 +144,7 @@ class Textractor:
         :param filepath: filepath to the document stored locally or on an S3 bucket.
         :type filepath: str, required
         :return: Returns a list of PIL Images, one for each page of the document
-        :rtype: List[Image]
+        :rtype: list[Image]
         """
         images = []
         if "s3://" in filepath:
@@ -127,12 +152,13 @@ class Textractor:
             bucket = edit_filepath.split("/")[0]
             key = edit_filepath[edit_filepath.index("/") + 1 :]
 
-            s3_client = (
-                boto3.session.Session(profile_name=self.profile_name).client("s3")
-                if self.profile_name is not None
-                else boto3.session.Session(region_name=self.region_name).client("s3")
-            )
-            file_obj = s3_client.get_object(Bucket=bucket, Key=key).get("Body").read()
+            # s3_client = (
+            #     boto3.session.Session(profile_name=profile_name).client("s3")
+            #     if profile_name is not None
+            #     else boto3.session.Session(region_name=region_name).client("s3")
+            # )
+
+            file_obj = self.s3_client.get_object(Bucket=bucket, Key=key).get("Body").read()
             if filepath.lower().endswith(".pdf"):
                 if IS_PDF_RENDERING_ENABLED:
                     images = rasterize_pdf(file_obj)
@@ -159,9 +185,7 @@ class Textractor:
 
         return images
 
-    def detect_document_text(
-        self, file_source, save_image: bool = True
-    ) -> Document:
+    def detect_document_text(self, file_source, save_image: bool = True) -> Document:
         """
         Make a call to the SYNC DetectDocumentText API, implicitly parses the response and produces a :class:`Document` object.
         This function is ideal for single page PDFs or single images.
@@ -176,11 +200,8 @@ class Textractor:
                  DetectDocumentText API stored within it.
         :rtype: Document
         """
-
         if isinstance(file_source, list) and len(file_source) > 1:
-            raise IncorrectMethodException(
-                "List contains more than 1 image. Call start_document_text_detection instead."
-            )
+            raise IncorrectMethodException("List contains more than 1 image. Call start_document_text_detection instead.")
 
         elif isinstance(file_source, str):
             logging.debug("Filepath given.")
@@ -189,10 +210,8 @@ class Textractor:
             else:
                 images = self._get_document_images_from_path(file_source)
                 if len(images) > 1:
-                    raise IncorrectMethodException(
-                        "Input contains more than 1 page. Call start_document_analysis() instead."
-                    )
-                file_source = _image_to_byte_array(images[0])    
+                    raise IncorrectMethodException("Input contains more than 1 page. Call start_document_analysis() instead.")
+                file_source = _image_to_byte_array(images[0])
 
         elif isinstance(file_source, Image.Image):
             logging.debug("PIL Image given.")
@@ -244,7 +263,7 @@ class Textractor:
 
     def start_document_text_detection(
         self,
-        file_source: Union[str, bytes, Image.Image],
+        file_source: str | bytes | Image.Image,
         s3_output_path: str = "",
         s3_upload_path: str = "",
         client_request_token: str = "",
@@ -274,21 +293,16 @@ class Textractor:
         :return: Lazy-loaded Document object
         :rtype: LazyDocument
         """
-
         original_file_source = file_source
 
         if not isinstance(file_source, (str, bytes, Image.Image)):
-            raise InputError(
-                f"file_source needs to be of type str, bytes or PIL Image, not {type(file_source)}"
-            )
+            raise InputError(f"file_source needs to be of type str, bytes or PIL Image, not {type(file_source)}")
 
         # If the file is not already in S3
         if not isinstance(file_source, str) or not file_source.startswith("s3://"):
             # Check if the user has given us a bucket to upload to
             if not s3_upload_path:
-                raise InputError(
-                    "For files not in S3, an S3 upload path must be provided"
-                )
+                raise InputError("For files not in S3, an S3 upload path must be provided")
 
             s3_file_path = os.path.join(s3_upload_path, str(uuid.uuid4()))
             upload_to_s3(self.s3_client, s3_file_path, file_source)
@@ -326,11 +340,7 @@ class Textractor:
         if save_image:
             if isinstance(original_file_source, Image.Image):
                 images = [original_file_source]
-            elif (
-                isinstance(original_file_source, list)
-                and len(original_file_source)
-                and isinstance(original_file_source[0], Image.Image)
-            ):
+            elif isinstance(original_file_source, list) and len(original_file_source) and isinstance(original_file_source[0], Image.Image):
                 images = original_file_source
             else:
                 images = self._get_document_images_from_path(original_file_source)
@@ -346,7 +356,7 @@ class Textractor:
         self,
         file_source,
         features,
-        queries: Union[QueriesConfig, List[Query], List[str]] = None,
+        queries: QueriesConfig | list[Query] | list[str] = None,
         save_image: bool = True,
     ) -> Document:
         """
@@ -358,7 +368,7 @@ class Textractor:
         :param features: List of TextractFeatures to be extracted from the Document by the TextractAPI
         :type features: list, required
         :param queries: Queries to run on the document
-        :type queries: Union[QueriesConfig, List[Query], List[str]]
+        :type queries: Union[QueriesConfig, list[Query], list[str]]
         :param save_image: Flag to indicate if document images are to be stored within the Document object. This is optional
                             and necessary only if the customer wants to visualize bounding boxes for their document entities.
         :type save_image: bool
@@ -368,9 +378,7 @@ class Textractor:
         :rtype: Document
         """
         if isinstance(file_source, list) and len(file_source) > 1:
-            raise IncorrectMethodException(
-                "List contains more than 1 image. Call start_document_analysis() instead."
-            )
+            raise IncorrectMethodException("List contains more than 1 image. Call start_document_analysis() instead.")
 
         elif isinstance(file_source, str):
             logging.debug("Filepath given.")
@@ -379,10 +387,8 @@ class Textractor:
             else:
                 images = self._get_document_images_from_path(file_source)
                 if len(images) > 1:
-                    raise IncorrectMethodException(
-                        "Input contains more than 1 page. Call start_document_analysis() instead."
-                    )
-                file_source = _image_to_byte_array(images[0])    
+                    raise IncorrectMethodException("Input contains more than 1 page. Call start_document_analysis() instead.")
+                file_source = _image_to_byte_array(images[0])
         elif isinstance(file_source, Image.Image):
             logging.debug("PIL Image given.")
             images = [file_source]
@@ -401,15 +407,11 @@ class Textractor:
             features = [features]
 
         if queries and TextractFeatures.QUERIES not in features:
-            raise InputError(
-                "Queries were given as a parameter but QUERIES is not enabled in the feature set"
-            )
+            raise InputError("Queries were given as a parameter but QUERIES is not enabled in the feature set")
 
         if queries and not isinstance(queries, QueriesConfig):
-            if not isinstance(queries, List):
-                raise InputError(
-                    f"Queries must be of type QueriesConfig, List[Query] or List[str], not {type(queries)}"
-                )
+            if not isinstance(queries, list):
+                raise InputError(f"Queries must be of type QueriesConfig, list[Query] or list[str], not {type(queries)}")
             if isinstance(queries[0], Query):
                 queries_config = QueriesConfig(queries)
                 queries = queries_config
@@ -417,9 +419,7 @@ class Textractor:
                 queries_config = QueriesConfig([Query(query) for query in queries])
                 queries = queries_config
             else:
-                raise InputError(
-                    f"Queries must be of type QueriesConfig, List[Query] or List[str], not {type(queries)}"
-                )
+                raise InputError(f"Queries must be of type QueriesConfig, list[Query] or list[str], not {type(queries)}")
 
         try:
             response = call_textract(
@@ -457,11 +457,11 @@ class Textractor:
 
     def start_document_analysis(
         self,
-        file_source: Union[str, bytes, Image.Image],
+        file_source: str | bytes | Image.Image,
         features,
         s3_output_path: str = "",
         s3_upload_path: str = "",
-        queries: Union[QueriesConfig, List[Query], List[str]] = None,
+        queries: QueriesConfig | list[Query] | list[str] = None,
         client_request_token: str = "",
         job_tag: str = "",
         save_image: bool = True,
@@ -493,21 +493,16 @@ class Textractor:
                  StartDocumentAnalysis API stored within it.
         :rtype: Document
         """
-
         original_file_source = file_source
 
         if not isinstance(file_source, (str, bytes, Image.Image)):
-            raise InputError(
-                f"file_source needs to be of type str, bytes or PIL Image, not {type(file_source)}"
-            )
+            raise InputError(f"file_source needs to be of type str, bytes or PIL Image, not {type(file_source)}")
 
         # If the file is not already in S3
         if not isinstance(file_source, str) or not file_source.startswith("s3://"):
             # Check if the user has given us a bucket to upload to
             if not s3_upload_path:
-                raise InputError(
-                    f"For files not in S3, an S3 upload path must be provided"
-                )
+                raise InputError("For files not in S3, an S3 upload path must be provided")
 
             s3_file_path = os.path.join(s3_upload_path, str(uuid.uuid4()))
             upload_to_s3(self.s3_client, s3_file_path, file_source)
@@ -522,15 +517,11 @@ class Textractor:
             features = [features]
 
         if queries and TextractFeatures.QUERIES not in features:
-            raise InputError(
-                "Queries were given as a parameter but QUERIES is not enabled in the feature set"
-            )
+            raise InputError("Queries were given as a parameter but QUERIES is not enabled in the feature set")
 
         if queries and not isinstance(queries, QueriesConfig):
-            if not isinstance(queries, List):
-                raise InputError(
-                    f"Queries must be of type QueriesConfig, List[Query] or List[str], not {type(queries)}"
-                )
+            if not isinstance(queries, list):
+                raise InputError(f"Queries must be of type QueriesConfig, list[Query] or list[str], not {type(queries)}")
             if isinstance(queries[0], Query):
                 queries_config = QueriesConfig(queries)
                 queries = queries_config
@@ -538,9 +529,7 @@ class Textractor:
                 queries_config = QueriesConfig([Query(query) for query in queries])
                 queries = queries_config
             else:
-                raise InputError(
-                    f"Queries must be of type QueriesConfig, List[Query] or List[str], not {type(queries)}"
-                )
+                raise InputError(f"Queries must be of type QueriesConfig, list[Query] or list[str], not {type(queries)}")
 
         try:
             response = call_textract(
@@ -569,11 +558,7 @@ class Textractor:
         if save_image:
             if isinstance(original_file_source, Image.Image):
                 images = [original_file_source]
-            elif (
-                isinstance(original_file_source, list)
-                and len(original_file_source)
-                and isinstance(original_file_source[0], Image.Image)
-            ):
+            elif isinstance(original_file_source, list) and len(original_file_source) and isinstance(original_file_source[0], Image.Image):
                 images = original_file_source
             else:
                 images = self._get_document_images_from_path(original_file_source)
@@ -588,15 +573,16 @@ class Textractor:
 
     def analyze_id(
         self,
-        file_source: Union[str, List[Image.Image], List[str]],
+        file_source: str | list[Image.Image] | list[str],
         save_image: bool = True,
     ) -> Document:
-        """AnalyzeID parses identity documents such as passports and driver's license and
+        """
+        AnalyzeID parses identity documents such as passports and driver's license and
         returns the result as a dictionary of standardized fields. See https://docs.aws.amazon.com/textract/latest/dg/identitydocumentfields.html
         for a complete list.
 
         :param file_source: Path to a file stored locally, on an S3 bucket or list of PIL Images
-        :type file_source: Union[str, List[Image.Image], List[str]]
+        :type file_source: Union[str, list[Image.Image], list[str]]
         :param save_image: Saves the images in the returned Document object for visualizing the results, defaults to False
         :type save_image: bool, optional
         :raises InputError: Raised when the file_source could not be parsed
@@ -642,14 +628,15 @@ class Textractor:
 
     def analyze_expense(
         self,
-        file_source: Union[str, List[Image.Image], List[str]],
+        file_source: str | list[Image.Image] | list[str],
         save_image: bool = True,
     ):
-        """Make a call to the SYNC AnalyzeExpense API, implicitly parses the response and produces a :class:`Document` object.
+        """
+        Make a call to the SYNC AnalyzeExpense API, implicitly parses the response and produces a :class:`Document` object.
         This function is ideal for multipage PDFs or list of images.
 
         :param file_source: Path to a file stored locally, on an S3 bucket or PIL Image
-        :type file_source: Union[str, List[Image.Image], List[str]]
+        :type file_source: Union[str, list[Image.Image], list[str]]
         :param save_image: Whether to keep the file source as PIL Images inside the returned Document object, defaults to False
         :type save_image: bool, optional
         :raises IncorrectMethodException: Raised when the file source type is incompatible with the Textract API being called
@@ -660,17 +647,13 @@ class Textractor:
         :rtype: Document
         """
         if isinstance(file_source, list) and len(file_source) > 1:
-            raise IncorrectMethodException(
-                "List contains more than 1 image. Call start_expense_analysis instead."
-            )
+            raise IncorrectMethodException("List contains more than 1 image. Call start_expense_analysis instead.")
 
         elif isinstance(file_source, str):
             logging.debug("Filepath given.")
             images = self._get_document_images_from_path(file_source)
             if len(images) > 1:
-                raise IncorrectMethodException(
-                    "Input contains more than 1 page. Call start_expense_analysis instead."
-                )
+                raise IncorrectMethodException("Input contains more than 1 page. Call start_expense_analysis instead.")
             file_source = _image_to_byte_array(images[0])
 
         elif isinstance(file_source, Image.Image):
@@ -718,14 +701,15 @@ class Textractor:
 
     def start_expense_analysis(
         self,
-        file_source: Union[str, bytes, Image.Image],
+        file_source: str | bytes | Image.Image,
         s3_output_path: str = "",
         s3_upload_path: str = "",
         client_request_token: str = "",
         job_tag: str = "",
         save_image: bool = True,
     ) -> LazyDocument:
-        """Make a call to the ASYNC StartExpenseAnalysis API, implicitly parses the response and produces a :class:`Document` object.
+        """
+        Make a call to the ASYNC StartExpenseAnalysis API, implicitly parses the response and produces a :class:`Document` object.
         This function is ideal for multipage PDFs or an image.
 
         :param file_source: Path to a file stored locally, on an S3 bucket or a PIL Image
@@ -750,21 +734,16 @@ class Textractor:
         :return: Lazy-loaded Document object
         :rtype: LazyDocument
         """
-
         original_file_source = file_source
 
         if not isinstance(file_source, (str, bytes, Image.Image)):
-            raise InputError(
-                f"file_source needs to be of type str, bytes or PIL Image, not {type(file_source)}"
-            )
+            raise InputError(f"file_source needs to be of type str, bytes or PIL Image, not {type(file_source)}")
 
         # If the file is not already in S3
         if not isinstance(file_source, str) or not file_source.startswith("s3://"):
             # Check if the user has given us a bucket to upload to
             if not s3_upload_path:
-                raise InputError(
-                    f"For files not in S3, an S3 upload path must be provided"
-                )
+                raise InputError("For files not in S3, an S3 upload path must be provided")
 
             s3_file_path = os.path.join(s3_upload_path, str(uuid.uuid4()))
             upload_to_s3(self.s3_client, s3_file_path, file_source)
@@ -799,11 +778,7 @@ class Textractor:
         if save_image:
             if isinstance(original_file_source, Image.Image):
                 images = [original_file_source]
-            elif (
-                isinstance(original_file_source, list)
-                and len(original_file_source)
-                and isinstance(original_file_source[0], Image.Image)
-            ):
+            elif isinstance(original_file_source, list) and len(original_file_source) and isinstance(original_file_source[0], Image.Image):
                 images = original_file_source
             else:
                 images = self._get_document_images_from_path(original_file_source)
@@ -815,22 +790,17 @@ class Textractor:
             images=images,
         )
 
-    def get_result(
-        self, job_id: str, api: Union[TextractAPI, Textract_API]
-    ) -> Document:
+    def get_result(self, job_id: str, api: TextractAPI | Textract_API) -> Document:
         """
         Retrieves Textract API output for a given job id.
         :param job_id: Textract API JobID
         :type job_id: str, required
         :return: Returns a Document object
-        :rtype: Document
+        :rtype: Document.
         """
-
         response = get_full_json(
             job_id,
-            TextractAPI.TextractAPI_to_Textract_API(api)
-            if isinstance(api, TextractAPI)
-            else api,
+            TextractAPI.TextractAPI_to_Textract_API(api) if isinstance(api, TextractAPI) else api,
             boto3_textract_client=self.textract_client,
             job_done_polling_interval=1,
         )
@@ -847,10 +817,9 @@ def _image_to_byte_array(image: Image) -> bytes:
     :param image: Image to be converted to bytearray
     :type image: PIL.Image, required
     :return: Returns a bytearray of the input image
-    :rtype: bytes
+    :rtype: bytes.
     """
     img_byte_arr = io.BytesIO()
     # We set quality to 95 and subsampling to 0 because the pillow defaults are very low resolution
     image.convert("RGB").save(img_byte_arr, format="JPEG", quality=95, subsampling=0)
-    img_byte_arr = img_byte_arr.getvalue()
-    return img_byte_arr
+    return img_byte_arr.getvalue()
