@@ -1,18 +1,24 @@
-"""The Document class is defined to host all the various DocumentEntity objects within it. :class:`DocumentEntity` objects can be 
-accessed, searched and exported the functions given below."""
+"""
+The Document class is defined to host all the various DocumentEntity objects within it. :class:`DocumentEntity` objects can be
+accessed, searched and exported the functions given below.
+"""
 
-import boto3
 import time
 from typing import Any
 
+import boto3
+from textractcaller.t_call import (
+    OutputConfig,
+    get_full_json,
+    get_job_response,
+)
+
+from textractor.data.constants import TextractAPI
 from textractor.entities.document import Document
 from textractor.parsers.response_parser import parse
-from textractor.data.constants import TextractAPI
-from textractor.utils.results_utils import results_exist, get_full_json_from_output_config
-from textractcaller.t_call import (
-    get_job_response,
-    get_full_json,
-    OutputConfig,
+from textractor.utils.results_utils import (
+    get_full_json_from_output_config,
+    results_exist,
 )
 
 
@@ -29,6 +35,7 @@ class LazyDocument:
         textract_client=None,
         images=None,
         output_config: OutputConfig = None,
+        s3_client=None,
     ):
         """
         Creates a new document, ideally containing entity objects pertaining to each page.
@@ -43,10 +50,12 @@ class LazyDocument:
         self._output_config = output_config
         self._s3_polling_interval = 1
         self._textract_polling_interval = 5
+        self.s3_client = s3_client
 
     @property
     def s3_polling_interval(self) -> int:
-        """Getter for the polling interval
+        """
+        Getter for the polling interval.
 
         :return: Time between get_full_result calls
         :rtype: int
@@ -55,7 +64,8 @@ class LazyDocument:
 
     @s3_polling_interval.setter
     def s3_polling_interval(self, s3_polling_interval: int):
-        """Setter for the polling interval
+        """
+        Setter for the polling interval.
 
         :param polling_interval: Time between get_full_result calls
         :type polling_interval: int
@@ -64,7 +74,8 @@ class LazyDocument:
 
     @property
     def textract_polling_interval(self) -> int:
-        """Getter for the polling interval
+        """
+        Getter for the polling interval.
 
         :return: Time between get_full_result calls
         :rtype: int
@@ -73,7 +84,8 @@ class LazyDocument:
 
     @textract_polling_interval.setter
     def textract_polling_interval(self, textract_polling_interval: int):
-        """Setter for the polling interval
+        """
+        Setter for the polling interval.
 
         :param polling_interval: Time between get_full_result calls
         :type polling_interval: int
@@ -82,7 +94,8 @@ class LazyDocument:
 
     @property
     def document(self) -> Document:
-        """Getter for the underlying Document object
+        """
+        Getter for the underlying Document object.
 
         :return: Proxied Document object
         :rtype: Document
@@ -90,7 +103,8 @@ class LazyDocument:
         return object.__getattribute__(self, "_document")
 
     def __getattr__(self, __name: str) -> Any:
-        """Proxy that gets the Document result when a document property is
+        """
+        Proxy that gets the Document result when a document property is
         accessed. This a blocking call.
 
         :param __name: Name of the attribute
@@ -98,7 +112,6 @@ class LazyDocument:
         :return: Value of the attribute
         :rtype: Any
         """
-
         # Prevents infinite recursion on LazyDocument properties
         if __name in [
             "job_id",
@@ -116,7 +129,9 @@ class LazyDocument:
 
         if self._document is None:
             if self._output_config:
-                s3_client = boto3.client("s3")
+                # s3_client = boto3.client("s3")
+                s3_client = self.s3_client
+
                 start = time.time()
                 response = None
                 while not results_exist(
@@ -129,9 +144,7 @@ class LazyDocument:
                     if time.time() - start > self._textract_polling_interval:
                         response = get_job_response(
                             job_id=self.job_id,
-                            textract_api=TextractAPI.TextractAPI_to_Textract_API(self._api)
-                            if isinstance(self._api, TextractAPI)
-                            else self._api,
+                            textract_api=TextractAPI.TextractAPI_to_Textract_API(self._api) if isinstance(self._api, TextractAPI) else self._api,
                             boto3_textract_client=self._textract_client,
                         )
                         job_status = response["JobStatus"]
@@ -142,9 +155,7 @@ class LazyDocument:
                         elif job_status == "SUCCEEDED" and "NextToken" in response:
                             response = get_full_json(
                                 self.job_id,
-                                TextractAPI.TextractAPI_to_Textract_API(self._api)
-                                if isinstance(self._api, TextractAPI)
-                                else self._api,
+                                TextractAPI.TextractAPI_to_Textract_API(self._api) if isinstance(self._api, TextractAPI) else self._api,
                                 self._textract_client,
                                 job_done_polling_interval=1,
                             )
@@ -153,7 +164,7 @@ class LazyDocument:
                             break
                         else:
                             raise Exception(f"Job failed with status: {job_status}\n{response}")
-                        
+
                 if not response:
                     response = get_full_json_from_output_config(
                         self._output_config,
@@ -165,9 +176,7 @@ class LazyDocument:
                     self._textract_client = boto3.client("textract")
                 response = get_full_json(
                     self.job_id,
-                    TextractAPI.TextractAPI_to_Textract_API(self._api)
-                    if isinstance(self._api, TextractAPI)
-                    else self._api,
+                    TextractAPI.TextractAPI_to_Textract_API(self._api) if isinstance(self._api, TextractAPI) else self._api,
                     self._textract_client,
                     job_done_polling_interval=self.textract_polling_interval,
                 )
@@ -176,6 +185,4 @@ class LazyDocument:
                 for i, page in enumerate(self._document.pages):
                     page.image = self._images[i]
             self._document.response = response
-        return object.__getattribute__(
-            object.__getattribute__(self, "_document"), __name
-        )
+        return object.__getattribute__(object.__getattribute__(self, "_document"), __name)

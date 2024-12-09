@@ -350,6 +350,7 @@ class Textractor:
             TextractAPI.DETECT_TEXT,
             textract_client=self.textract_client,
             images=images,
+            s3_client=self.s3_client,
         )
 
     def analyze_document(
@@ -569,6 +570,7 @@ class Textractor:
             textract_client=self.textract_client,
             images=images,
             output_config=output_config,
+            s3_client=self.s3_client,
         )
 
     def analyze_id(
@@ -788,6 +790,7 @@ class Textractor:
             TextractAPI.EXPENSE,
             textract_client=self.textract_client,
             images=images,
+            s3_client=self.s3_client,
         )
 
     def get_result(self, job_id: str, api: TextractAPI | Textract_API) -> Document:
