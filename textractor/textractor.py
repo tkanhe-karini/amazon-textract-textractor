@@ -24,6 +24,7 @@ import uuid
 from copy import deepcopy
 
 import boto3
+from botocore.config import Config
 from PIL import Image
 from textractcaller import (
     OutputConfig,
@@ -132,8 +133,22 @@ class Textractor:
         else:
             raise ValueError("Unable to initiate Textractor. Provide either profile_name, credentials, or IAM role details.")
 
+        my_config = Config(
+            retries={
+                "max_attempts": 10,  # Total attempts including initial call
+                "mode": "standard",  # 'standard' includes exponential backoff
+            },
+            max_pool_connections=50,  # Increase the connection pool size
+            connect_timeout=5,
+            read_timeout=60,
+        )
+
         # Initialize clients
-        self.textract_client = session.client("textract", region_name=region_name)
+        self.textract_client = session.client(
+            "textract",
+            region_name=region_name,
+            config=my_config,
+        )
         self.s3_client = session.client("s3")
 
     def _get_document_images_from_path(self, filepath: str) -> list[Image.Image]:
